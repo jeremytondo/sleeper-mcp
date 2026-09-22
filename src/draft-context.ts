@@ -110,7 +110,21 @@ export class DraftContextService {
     }
 
     const sortedPicks = [...snapshotPicks].sort((a, b) => a.pick_no - b.pick_no);
-    const draftedIds = new Set(sortedPicks.map((pick) => pick.player_id));
+    // Picks supplement rosters while drafting, but are only history after the draft.
+    const includeDraftPicks =
+      league.status !== "in_season" &&
+      league.status !== "complete" &&
+      finalDraft.status !== "complete";
+    const unavailableIds = new Set(
+      rosters.flatMap((roster) => [
+        ...(roster.players ?? []),
+        ...(roster.reserve ?? []),
+        ...(roster.taxi ?? []),
+      ]),
+    );
+    if (includeDraftPicks) {
+      for (const pick of sortedPicks) unavailableIds.add(pick.player_id);
+    }
     const userPicks = sortedPicks.filter(
       (pick) => numericRosterId(pick.roster_id) === userRoster.roster_id,
     );
@@ -126,7 +140,7 @@ export class DraftContextService {
     );
 
     const context = {
-      schema_version: "2026-08-25",
+      schema_version: "2026-09-22",
       refreshed_at: new Date(this.now()).toISOString(),
       refresh_latency_ms: Math.max(0, this.now() - startedAt),
       source: "Sleeper read-only API",
@@ -161,7 +175,9 @@ export class DraftContextService {
           (finalDraft.settings.rounds ?? league.roster_positions.length),
       },
       current_pick: currentPick,
-      user_team: buildTeamContext(userRoster, user, userPicks, league, playerIndex, true),
+      user_team: buildTeamContext(
+        userRoster, user, userPicks, league, playerIndex, true, includeDraftPicks,
+      ),
       other_teams: rosters
         .filter((roster) => roster.roster_id !== userRoster.roster_id)
         .map((roster) => {
@@ -169,18 +185,29 @@ export class DraftContextService {
           const rosterPicks = sortedPicks.filter(
             (pick) => numericRosterId(pick.roster_id) === roster.roster_id,
           );
-          return buildTeamContext(roster, owner, rosterPicks, league, playerIndex, false);
+          return buildTeamContext(
+            roster, owner, rosterPicks, league, playerIndex, false, includeDraftPicks,
+          );
         }),
       draft_history: sortedPicks.map((pick) => enrichPick(pick, playerIndex)),
+      availability: {
+        basis: includeDraftPicks ? "current_rosters_and_draft_picks" : "current_rosters",
+        waiver_status: "unknown",
+        lock_status: "unknown",
+      },
       available_players_by_position: buildAvailablePlayers(
         playerIndex,
-        draftedIds,
+        unavailableIds,
         league.roster_positions,
         limit,
       ),
       interpretation_notes: [
         "This snapshot is live Sleeper context, not a recommendation.",
-        "Available players are ordered by Sleeper search_rank only; combine them with a separate rankings or research source before advising.",
+        includeDraftPicks
+          ? "Availability excludes all current league rosters (including reserve and taxi) and draft picks while the draft is pending or active."
+          : "Availability is recomputed from all current league rosters (including reserve and taxi); draft history does not determine ownership. Chopped players enter the pool only when Sleeper removes them from rosters.",
+        "Available players are limited per position and ordered by Sleeper search_rank, with unranked players last; combine them with a separate rankings or research source before advising.",
+        "The documented public Sleeper API does not expose per-player waiver or transaction lock state. These are unrostered candidates for league positions, not a guarantee of an immediate add or successful claim; waiver_status and lock_status are unknown. League waiver settings are returned in league.league_settings.",
         "Player metadata is cached daily, while draft, picks, rosters, users, league settings, and traded picks are refreshed on every call.",
         ...(playerIndex.size === 0
           ? ["The Sleeper player catalog was unavailable, so player enrichment and available-player lists may be empty; live draft state is still current."]
@@ -278,13 +305,17 @@ function buildTeamContext(
   league: SleeperLeague,
   players: Map<string, SleeperPlayer>,
   includePlayers: boolean,
+  includeDraftPicks: boolean,
 ) {
   const inactiveIds = new Set([...(roster.reserve ?? []), ...(roster.taxi ?? [])]);
-  const pickByPlayerId = new Map(picks.map((pick) => [pick.player_id, pick]));
+  const rosterPicks = includeDraftPicks ? picks : [];
+  const pickByPlayerId = new Map(rosterPicks.map((pick) => [pick.player_id, pick]));
   const activePlayerIds = [
-    ...(roster.players ?? []).filter((playerId) => !inactiveIds.has(playerId)),
-    ...picks.map((pick) => pick.player_id),
-  ].filter((playerId, index, all) => all.indexOf(playerId) === index);
+    ...(roster.players ?? []),
+    ...rosterPicks.map((pick) => pick.player_id),
+  ].filter((playerId, index, all) =>
+    !inactiveIds.has(playerId) && all.indexOf(playerId) === index
+  );
   const teamPlayers = activePlayerIds.map((playerId) => ({
     playerId,
     pick: pickByPlayerId.get(playerId),
@@ -406,7 +437,7 @@ function ownerForRoster(roster: SleeperRoster, users: SleeperUser[]): SleeperUse
 
 function buildAvailablePlayers(
   players: Map<string, SleeperPlayer>,
-  draftedIds: Set<string>,
+  unavailableIds: Set<string>,
   rosterPositions: string[],
   limit: number,
 ) {
@@ -421,19 +452,15 @@ function buildAvailablePlayers(
   for (const position of positions) {
     result[position] = [...players.values()]
       .filter((player) => {
-        const rank = player.search_rank;
         return (
-          !draftedIds.has(player.player_id) &&
+          !unavailableIds.has(player.player_id) &&
           player.active !== false &&
-          playerPositions(player).includes(position) &&
-          typeof rank === "number" &&
-          Number.isFinite(rank) &&
-          rank > 0
+          playerPositions(player).includes(position)
         );
       })
       .sort((a, b) => {
-        const rankDifference = (a.search_rank ?? Number.MAX_SAFE_INTEGER) -
-          (b.search_rank ?? Number.MAX_SAFE_INTEGER);
+        const rankDifference = (playerSearchRank(a) ?? Number.MAX_SAFE_INTEGER) -
+          (playerSearchRank(b) ?? Number.MAX_SAFE_INTEGER);
         return rankDifference || playerName(a).localeCompare(playerName(b));
       })
       .slice(0, limit)
@@ -447,11 +474,16 @@ function buildAvailablePlayers(
         status: player.status ?? null,
         age: player.age ?? null,
         years_experience: player.years_exp ?? null,
-        sleeper_search_rank: player.search_rank,
+        sleeper_search_rank: playerSearchRank(player),
       }));
   }
 
   return result;
+}
+
+function playerSearchRank(player: SleeperPlayer): number | null {
+  const rank = player.search_rank;
+  return typeof rank === "number" && Number.isFinite(rank) && rank > 0 ? rank : null;
 }
 
 function buildCurrentPick(

@@ -22,6 +22,11 @@ const snapshotOutputSchema = z.object({
   user_team: z.record(z.string(), z.unknown()),
   other_teams: z.array(z.record(z.string(), z.unknown())),
   draft_history: z.array(z.record(z.string(), z.unknown())),
+  availability: z.object({
+    basis: z.enum(["current_rosters", "current_rosters_and_draft_picks"]),
+    waiver_status: z.literal("unknown"),
+    lock_status: z.literal("unknown"),
+  }),
   available_players_by_position: z.record(
     z.string(),
     z.array(z.record(z.string(), z.unknown())),
@@ -45,7 +50,7 @@ export function createMcpServer(
     { name: "sleeper-draft-assistant", version: "0.1.0" },
     {
       instructions:
-        "Call get_live_draft_context immediately before every Sleeper draft recommendation, even if it was called earlier in the chat. Treat its available-player ordering as Sleeper search metadata, not an expert ranking. This server is read-only and never makes draft selections.",
+        "Call get_live_draft_context immediately before every Sleeper draft or player-availability recommendation, even if it was called earlier in the chat. In-season availability is based on fresh league rosters. Per-player waiver and lock status are unknown. Treat available-player ordering as Sleeper search metadata, not an expert ranking. This server is read-only and never makes draft selections.",
     },
   );
 
@@ -54,7 +59,7 @@ export function createMcpServer(
     {
       title: "Get live Sleeper draft context",
       description:
-        "Refresh the current Sleeper draft and return the user's team, open roster slots, current pick, picks until their next selection, complete draft history, other teams' needs, and available players. Call this immediately before answering any draft recommendation, comparison, availability, roster-priority, or on-the-clock question.",
+        "Refresh the Sleeper draft and league rosters and return the user's team, open roster slots, current pick, picks until their next selection, complete draft history, other teams' needs, and available players. After the draft, availability excludes current league rosters instead of historical picks, including for chopped leagues. Per-player waiver and lock status are unknown. Call this immediately before answering any draft recommendation, comparison, availability, roster-priority, or on-the-clock question.",
       inputSchema: {
         draft_id: z
           .string()

@@ -18,6 +18,28 @@ test("caches the large player catalog", async () => {
   assert.equal(first, second);
 });
 
+test("fetches league rosters every time while retaining cached player metadata", async () => {
+  let rosterRequests = 0;
+  let catalogRequests = 0;
+  const fetcher: typeof fetch = async (url) => {
+    if (String(url).endsWith("/league/league-1/rosters")) {
+      rosterRequests += 1;
+      return Response.json([{ roster_id: 1, players: rosterRequests === 1 ? [] : ["p1"] }]);
+    }
+    assert.ok(String(url).endsWith("/players/nfl"));
+    catalogRequests += 1;
+    return Response.json({ p1: { player_id: "p1" } });
+  };
+  const client = new SleeperClient({ fetch: fetcher });
+
+  assert.deepEqual((await client.getLeagueRosters("league-1"))[0]!.players, []);
+  await client.getPlayers();
+  assert.deepEqual((await client.getLeagueRosters("league-1"))[0]!.players, ["p1"]);
+  await client.getPlayers();
+  assert.equal(rosterRequests, 2);
+  assert.equal(catalogRequests, 1);
+});
+
 test("surfaces upstream HTTP failures without response bodies", async () => {
   const fetcher: typeof fetch = async () => new Response("sensitive upstream body", { status: 503 });
   const client = new SleeperClient({ fetch: fetcher });
