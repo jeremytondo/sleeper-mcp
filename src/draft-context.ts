@@ -9,6 +9,7 @@ import type {
   SleeperTradedPick,
   SleeperUser,
 } from "./sleeper-types.js";
+import { buildSelectedLineup } from "./league-context.js";
 
 const NON_DRAFT_SLOTS = new Set(["BN", "BENCH", "IR", "RESERVE", "TAXI"]);
 
@@ -77,12 +78,16 @@ export class DraftContextService {
       throw new DraftContextError(`Draft ${options.draftId} is not attached to a league.`);
     }
 
+    let catalogUnavailable = false;
     const [league, rosters, users, tradedPicks, players] = await Promise.all([
       this.sleeper.getLeague(draft.league_id, options.signal),
       this.sleeper.getLeagueRosters(draft.league_id, options.signal),
       this.sleeper.getLeagueUsers(draft.league_id, options.signal),
       this.sleeper.getTradedPicks(options.draftId, options.signal),
-      this.sleeper.getPlayers().catch(() => ({} as SleeperPlayers)),
+      this.sleeper.getPlayers().catch(() => {
+        catalogUnavailable = true;
+        return {} as SleeperPlayers;
+      }),
     ]);
 
     const [finalDraft, finalPicks] = await Promise.all([
@@ -118,6 +123,7 @@ export class DraftContextService {
     const unavailableIds = new Set(
       rosters.flatMap((roster) => [
         ...(roster.players ?? []),
+        ...(roster.starters ?? []).filter((id) => id && id !== "0"),
         ...(roster.reserve ?? []),
         ...(roster.taxi ?? []),
       ]),
@@ -144,6 +150,12 @@ export class DraftContextService {
       refreshed_at: new Date(this.now()).toISOString(),
       refresh_latency_ms: Math.max(0, this.now() - startedAt),
       source: "Sleeper read-only API",
+      partial: catalogUnavailable || stateChanged,
+      sources: {
+        live_data_fetched_at: new Date(this.now()).toISOString(),
+        player_catalog: this.sleeper.getPlayerCatalogInfo?.() ?? null,
+        player_catalog_status: catalogUnavailable ? "unavailable" : "available",
+      },
       identity: {
         user_id: user.user_id,
         username: user.username ?? null,
@@ -203,13 +215,15 @@ export class DraftContextService {
       ),
       interpretation_notes: [
         "This snapshot is live Sleeper context, not a recommendation.",
+        "Legacy lineup_slots, open_starter_slots and bench describe potential roster coverage for drafting, not the manager's selected lineup. selected_lineup preserves the current ordered starters, including empty and missing slots.",
         includeDraftPicks
           ? "Availability excludes all current league rosters (including reserve and taxi) and draft picks while the draft is pending or active."
           : "Availability is recomputed from all current league rosters (including reserve and taxi); draft history does not determine ownership. Chopped players enter the pool only when Sleeper removes them from rosters.",
         "Available players are limited per position and ordered by Sleeper search_rank, with unranked players last; combine them with a separate rankings or research source before advising.",
         "The documented public Sleeper API does not expose per-player waiver or transaction lock state. These are unrostered candidates for league positions, not a guarantee of an immediate add or successful claim; waiver_status and lock_status are unknown. League waiver settings are returned in league.league_settings.",
         "Player metadata is cached daily, while draft, picks, rosters, users, league settings, and traded picks are refreshed on every call.",
-        ...(playerIndex.size === 0
+        ...(stateChanged ? ["The draft changed during the final refresh; the response combines separately fetched resources and is not an atomic snapshot."] : []),
+        ...(catalogUnavailable
           ? ["The Sleeper player catalog was unavailable, so player enrichment and available-player lists may be empty; live draft state is still current."]
           : []),
       ],
@@ -312,6 +326,7 @@ function buildTeamContext(
   const pickByPlayerId = new Map(rosterPicks.map((pick) => [pick.player_id, pick]));
   const activePlayerIds = [
     ...(roster.players ?? []),
+    ...(roster.starters ?? []).filter((id) => id && id !== "0"),
     ...rosterPicks.map((pick) => pick.player_id),
   ].filter((playerId, index, all) =>
     !inactiveIds.has(playerId) && all.indexOf(playerId) === index
@@ -339,6 +354,7 @@ function buildTeamContext(
     reserve_count: roster.reserve?.length ?? 0,
     taxi_count: roster.taxi?.length ?? 0,
     position_counts: positionCounts,
+    roster_settings: roster.settings ?? null,
   };
 
   if (includePlayers) {
@@ -347,6 +363,19 @@ function buildTeamContext(
     result.open_starter_slots = assignments.openStarterSlots;
     result.bench = assignments.bench;
     result.players = teamPlayers.map((teamPlayer) => enrichTeamPlayer(teamPlayer, players));
+    const selectedLineup = buildSelectedLineup(
+      league.roster_positions, roster.starters, Object.fromEntries(players),
+    );
+    result.selected_lineup = selectedLineup;
+    result.selected_starters_raw = roster.starters ?? null;
+    const selectedIds = new Set((roster.starters ?? []).filter((id) => id && id !== "0"));
+    result.current_bench_player_ids = Array.isArray(roster.starters) && roster.players !== undefined &&
+      !selectedLineup.some((slot) => slot.selection_state === "missing")
+      ? [...new Set(roster.players ?? [])]
+        .filter((id) => id && id !== "0" && !inactiveIds.has(id) && !selectedIds.has(id))
+      : null;
+    result.reserve_player_ids = [...new Set(roster.reserve ?? [])];
+    result.taxi_player_ids = [...new Set(roster.taxi ?? [])];
   }
 
   return result;

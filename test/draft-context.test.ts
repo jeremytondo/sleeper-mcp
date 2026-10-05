@@ -245,3 +245,40 @@ test("returns live draft state when the player catalog is temporarily unavailabl
   assert.deepEqual(snapshot.available_players_by_position, { QB: [], RB: [], TE: [], WR: [] });
   assert.match((snapshot.interpretation_notes as string[]).at(-1) ?? "", /unavailable/i);
 });
+
+test("keeps draft coverage compatible while exposing the actual empty selected slot", async () => {
+  const gateway = new FixtureSleeperGateway();
+  gateway.draft.status = "complete";
+  gateway.league.status = "in_season";
+  gateway.league.roster_positions = ["QB", "FLEX", "FLEX", "BN"];
+  gateway.rosters[0]!.players = ["p1", "p2", "p3", "p4"];
+  gateway.rosters[0]!.starters = ["p1", "0", "p3"];
+  const snapshot = await new DraftContextService(gateway).getLiveDraftContext({ draftId: "draft-1", user: "user-1" });
+  const team = snapshot.user_team as Record<string, unknown>;
+  assert.deepEqual(team.open_starter_slots, []);
+  const lineup = team.selected_lineup as Array<Record<string, unknown>>;
+  assert.deepEqual(lineup.map((slot) => slot.slot), ["QB", "FLEX", "FLEX"]);
+  assert.equal(lineup[1]!.selection_state, "empty");
+  assert.equal(lineup[1]!.selected_player_id, "0");
+  assert.deepEqual(team.current_bench_player_ids, ["p2", "p4"]);
+  assert.equal(snapshot.partial, false);
+});
+
+test("does not label all players bench when current selected starters are missing", async () => {
+  const gateway = new FixtureSleeperGateway();
+  gateway.rosters[0]!.players = ["p1"];
+  const snapshot = await new DraftContextService(gateway).getLiveDraftContext({ draftId: "draft-1", user: "user-1" });
+  const team = snapshot.user_team as Record<string, unknown>;
+  assert.equal(team.current_bench_player_ids, null);
+  assert.ok((team.selected_lineup as Array<Record<string, unknown>>).every((slot) => slot.selection_state === "missing"));
+});
+
+test("does not guess the bench when Sleeper returns a truncated selected lineup", async () => {
+  const gateway = new FixtureSleeperGateway();
+  gateway.rosters[0]!.players = ["p1", "p2"];
+  gateway.rosters[0]!.starters = ["p1"];
+  const snapshot = await new DraftContextService(gateway).getLiveDraftContext({ draftId: "draft-1", user: "user-1" });
+  const team = snapshot.user_team as Record<string, unknown>;
+  assert.equal(team.current_bench_player_ids, null);
+  assert.equal((team.selected_lineup as Array<Record<string, unknown>>)[0]!.selection_state, "selected");
+});

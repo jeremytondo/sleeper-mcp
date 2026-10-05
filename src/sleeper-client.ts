@@ -1,11 +1,15 @@
 import type {
+  LeagueGateway,
+  PlayerCatalogInfo,
   SleeperDraft,
   SleeperDraftPick,
-  SleeperGateway,
   SleeperLeague,
+  SleeperMatchup,
+  SleeperNflState,
   SleeperPlayers,
   SleeperRoster,
   SleeperTradedPick,
+  SleeperTransaction,
   SleeperUser,
 } from "./sleeper-types.js";
 
@@ -30,13 +34,13 @@ interface SleeperClientOptions {
   now?: () => number;
 }
 
-export class SleeperClient implements SleeperGateway {
+export class SleeperClient implements LeagueGateway {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
   private readonly playerCacheTtlMs: number;
   private readonly fetcher: typeof globalThis.fetch;
   private readonly now: () => number;
-  private playerCache?: { value: SleeperPlayers; expiresAt: number };
+  private playerCache?: { value: SleeperPlayers; fetchedAt: number; expiresAt: number };
   private playerRequest?: Promise<SleeperPlayers>;
 
   constructor(options: SleeperClientOptions = {}) {
@@ -79,6 +83,30 @@ export class SleeperClient implements SleeperGateway {
     return this.get(`/league/${encodeURIComponent(leagueId)}/users`, signal);
   }
 
+  getNflState(signal?: AbortSignal): Promise<SleeperNflState> {
+    return this.get("/state/nfl", signal);
+  }
+
+  getUserLeagues(userId: string, season: string, signal?: AbortSignal): Promise<SleeperLeague[]> {
+    return this.get(`/user/${encodeURIComponent(userId)}/leagues/nfl/${encodeURIComponent(season)}`, signal);
+  }
+
+  getLeagueMatchups(leagueId: string, week: number, signal?: AbortSignal): Promise<SleeperMatchup[]> {
+    return this.get(`/league/${encodeURIComponent(leagueId)}/matchups/${encodeURIComponent(week)}`, signal);
+  }
+
+  getLeagueTransactions(leagueId: string, week: number, signal?: AbortSignal): Promise<SleeperTransaction[]> {
+    return this.get(`/league/${encodeURIComponent(leagueId)}/transactions/${encodeURIComponent(week)}`, signal);
+  }
+
+  getPlayerCatalogInfo(): PlayerCatalogInfo {
+    return {
+      fetched_at: this.playerCache ? new Date(this.playerCache.fetchedAt).toISOString() : null,
+      expires_at: this.playerCache ? new Date(this.playerCache.expiresAt).toISOString() : null,
+      stale: !this.playerCache || this.playerCache.expiresAt <= this.now(),
+    };
+  }
+
   async getPlayers(): Promise<SleeperPlayers> {
     const now = this.now();
     if (this.playerCache && this.playerCache.expiresAt > now) {
@@ -88,9 +116,14 @@ export class SleeperClient implements SleeperGateway {
     if (!this.playerRequest) {
       this.playerRequest = this.get<SleeperPlayers>("/players/nfl")
         .then((value) => {
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            throw new SleeperApiError("Sleeper returned invalid player catalog", 200, `${this.baseUrl}/players/nfl`);
+          }
+          const fetchedAt = this.now();
           this.playerCache = {
             value,
-            expiresAt: this.now() + this.playerCacheTtlMs,
+            fetchedAt,
+            expiresAt: fetchedAt + this.playerCacheTtlMs,
           };
           return value;
         })

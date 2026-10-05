@@ -1,14 +1,49 @@
-# Sleeper Draft Assistant MCP
+# Sleeper League Toolkit MCP
 
 A read-only prototype that gives ChatGPT a fresh, league-aware Sleeper snapshot during the draft and season.
 
-The server exposes one focused Streamable HTTP MCP tool, `get_live_draft_context`. Every call refreshes the draft, picks, traded picks, league, rosters, and league users. It returns:
+The server exposes six read-only Streamable HTTP MCP tools. League discovery, current rosters, selected lineups, player ownership, weekly scores and public transaction history are available without a draft ID.
 
-- the manager's current players (supplemented with picks during the draft), position counts, filled/open starter slots, and bench space;
+## Tools
+
+| Tool | Inputs | Returns |
+| --- | --- | --- |
+| `list_leagues` | `user` (or configured default), optional `season` | NFL league IDs, rules/scoring and previous-season league links |
+| `get_league_context` | `league_id`, optional `user`, `week` | Current roster/selected lineup, rules, budget fields and the requested week’s league-wide scores/lineups |
+| `get_league_rosters` | `league_id` | Every team’s current full ownership, selected starters, bench, reserve, taxi and raw roster settings |
+| `search_players` | Optional `query`, `positions`, `player_ids`, `league_ids`, `available_only`, `limit`, `offset` | Catalog matches and current ownership across the supplied leagues |
+| `get_league_activity` | `league_id`, optional `weeks`, `types`, `roster_ids`, `player_ids`, `limit`, `offset` | Public adds/drops/waivers/trades, exposed completed bids and pick/budget transfers |
+| `get_live_draft_context` | Existing `draft_id`, `user`, `available_limit_per_position` | Backwards-compatible live draft snapshot |
+
+All tools return structured data under `snapshot`. The new league tools share `schema_version`, `refreshed_at`, `source`, `partial`, `issues` and `sources`; check these before treating empty or incomplete results as authoritative. Source timestamps mean retrieval time, not an upstream last-modified time. Calls combine independently fetched resources, not an atomic Sleeper snapshot. Catalog metadata includes the last successful fetch, expiration and stale flag. A catalog refresh failure is marked unavailable rather than silently served as fresh.
+
+### League and player queries
+
+- Omit `season` to resolve it from live NFL state, rather than the calendar year. This matters in January.
+- Omit `week`/`weeks` only for a matching regular season. Historical or non-regular seasons need explicit week input; unresolved context is marked partial. Requested-week matchup lineups are separate from the current roster and current selected starters.
+- Selected lineups preserve the order of `roster.starters` against starter positions, including repeated FLEX slots, empty `"0"` slots and missing entries. Bench coverage never fills a selected empty slot.
+- Ownership includes reserve, taxi, starters and ownerless rosters. Removing an owner is not a release. Neither low weekly scores nor ownerless teams establish documented elimination status.
+- Budget fields are returned raw. A missing field is not zero. League budget minus reported usage is not guaranteed remaining FAAB because trades or commissioner adjustments can change it.
+- Search uses the whole catalog, not the draft tool’s top-30-per-position candidates. Explicit IDs can identify catalog-missing players; name and position filtering depend on available catalog metadata. Search does not silently exclude inactive players.
+- `available_only: true` requires `league_ids` and means known unrostered in every supplied league. Ownership failures are flagged partial and never counted as available. Waiver clearance, lock status and claim eligibility remain unknown.
+- Search/activity pagination defaults to 50 items, maximum 100. Use `offset` and the returned pagination metadata to continue; pages across calls can change as live data changes. Search accepts up to 10 league IDs and 100 player IDs.
+- Activity defaults to the current and previous regular-season weeks and accepts up to 22 distinct requested weeks (1–22), with optional types `waiver`, `free_agent`, `trade`. Duplicate transactions are deduplicated before paging. Failed weeks are listed as partial, not mistaken for no activity. Public transaction statuses are preserved, including failed/pending records if returned. Only completed public waiver bids are summarized; waiver_bid is omitted from settings/raw data for other statuses. Private pending bids are unavailable.
+- News and projections are explicitly unavailable. There is no external provider, new credential, lineup write, waiver claim, scheduler or strategy engine.
+
+For example, use `list_leagues` to find the league ID, then call `get_league_context` for a lineup question, `search_players` with specific `player_ids` and several `league_ids` for cross-league ownership, or `get_league_activity` with `weeks: [4, 5]` and `types: ["waiver"]` for recent waiver activity.
+
+## Draft compatibility
+
+`get_live_draft_context` keeps its original input and response fields. Every call refreshes the draft, picks, traded picks, league, rosters, and league users. It returns:
+
+- the manager's current players (supplemented with picks during the draft), position counts, potential starter coverage and bench capacity;
+- `selected_lineup`, `selected_starters_raw`, current bench/reserve/taxi IDs and raw roster settings as additive fields;
 - the current selection, manager on the clock, and picks until the user's next selection;
 - league scoring, roster, and draft settings;
 - the full draft history and compact positional summaries for every other roster;
 - available player candidates by league position, with player IDs, names, fantasy positions, NFL teams, injuries, status, and search rank.
+
+`lineup_slots`, `open_starter_slots` and `bench` retain their draft coverage meanings; they are not selected starter assignments. Use `selected_lineup` for actual current selections.
 
 Sleeper player metadata is cached for 24 hours because `/players/nfl` is a large, slow-changing catalog. Every call fetches fresh league rosters and excludes all rostered players, including reserve and taxi players, from availability. During a pending or active draft, draft picks are excluded too. Once the draft is complete, or the league is `in_season` or `complete`, only current rosters determine ownership; historical picks do not keep dropped players out of the pool or add them back to team summaries. Failed roster requests fail the call instead of returning stale availability.
 
@@ -28,7 +63,7 @@ cp .env.example .env
 npm run dev
 ```
 
-Optionally set `SLEEPER_USER_ID` to a Sleeper username or user ID. If it is unset, the MCP call must provide `user`.
+Optionally set `SLEEPER_USER_ID` to a Sleeper username or user ID. If it is unset, `list_leagues` and `get_live_draft_context` require `user`; `get_league_context` can still return league-wide context without selecting a manager’s roster. Other tools need no user input.
 
 The endpoints are:
 
@@ -46,7 +81,7 @@ npm run build
 npx @modelcontextprotocol/inspector@latest
 ```
 
-Point MCP Inspector at `http://localhost:3000/mcp`, list the tools, and call `get_live_draft_context` with a real `draft_id` and `user`.
+Point MCP Inspector at `http://localhost:3000/mcp`, list all six tools, then call `list_leagues` with a real `user` or `get_league_context` with a `league_id`. The existing draft tool still accepts a real `draft_id` and `user`. The integration suite uses a loopback HTTP server and fixtures; it does not contact live Sleeper or require credentials. No lint script is configured.
 
 The included `Dockerfile` builds a production image for any HTTPS-capable container host:
 
@@ -74,7 +109,7 @@ docker compose -f compose.tunnel.yml ps
 docker compose -f compose.tunnel.yml exec -T sleeper-mcp node -e "fetch('http://127.0.0.1:3000/health').then(async r => { console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1); })"
 ```
 
-This rebuilds and replaces the server while preserving the existing tunnel client. Confirm both services are running, then call `get_live_draft_context` through the existing ChatGPT connection. For the availability fix, an in-season response should have `schema_version: "2026-09-22"` and `availability.basis: "current_rosters"`.
+This rebuilds and replaces the server while preserving the existing tunnel client. Confirm both services are running, then call `get_live_draft_context` through the existing ChatGPT connection. The legacy draft schema remains `"2026-09-22"` with additive selected-lineup/freshness fields, and an in-season response uses `availability.basis: "current_rosters"`. Confirm that tool discovery also lists the five new league tools.
 
 See the [official Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) for tunnel setup and connection troubleshooting.
 
@@ -84,7 +119,7 @@ See the [official Secure MCP Tunnel guide](https://developers.openai.com/api/doc
 - No ranking engine: external rankings, projections, injury research, and news remain separate.
 - Snake/linear drafts: current and future pick math supports these formats, including traded picks. Auction nomination order is reported as unsupported.
 - Public Sleeper data: the optional bearer token protects the endpoint, but it is not per-user authorization. Use a secure tunnel for the personal proof and add OAuth before operating this as a shared service.
-- Availability depends on the cached Sleeper player catalog, including its position and active flags. Players marked `active: false` and positions outside the league's eligible slots are omitted. Injury status and an absent NFL team do not by themselves exclude a player. Metadata can lag by up to the configured cache lifetime.
+- Availability depends on the cached Sleeper player catalog, including its position and active flags. The legacy draft candidate list omits players marked `active: false` and positions outside the league's eligible slots. The full-catalog search exposes inactive players instead of silently hiding them. Injury status and an absent NFL team do not by themselves exclude a player. Metadata can lag by up to the configured cache lifetime.
 
 ## Environment variables
 

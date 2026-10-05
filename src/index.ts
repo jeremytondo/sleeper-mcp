@@ -1,4 +1,5 @@
 import { DraftContextService } from "./draft-context.js";
+import { LeagueContextService } from "./league-context.js";
 import { SleeperClient } from "./sleeper-client.js";
 import { createApp } from "./server.js";
 
@@ -30,7 +31,7 @@ const app = createApp(draftContext, {
     .filter(Boolean),
   maxConcurrentRequests: positiveInteger(process.env.MCP_MAX_CONCURRENT_REQUESTS, 8),
   maxRequestsPerMinute: positiveInteger(process.env.MCP_MAX_REQUESTS_PER_MINUTE, 60),
-});
+}, new LeagueContextService(sleeper));
 
 const host = process.env.HOST ?? "127.0.0.1";
 const httpServer = app.listen(port, host, () => {
