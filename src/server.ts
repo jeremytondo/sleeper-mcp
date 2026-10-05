@@ -4,12 +4,15 @@ import express, { type Express } from "express";
 import { z } from "zod";
 
 import { DraftContextService } from "./draft-context.js";
+import { LeagueContextService } from "./league-context.js";
 
 const snapshotOutputSchema = z.object({
   schema_version: z.string(),
   refreshed_at: z.string(),
   refresh_latency_ms: z.number(),
   source: z.string(),
+  partial: z.boolean(),
+  sources: z.record(z.string(), z.unknown()),
   identity: z.object({
     user_id: z.string(),
     username: z.string().nullable(),
@@ -45,12 +48,13 @@ export interface ServerOptions {
 export function createMcpServer(
   draftContext: DraftContextService,
   options: ServerOptions = {},
+  leagueContext?: LeagueContextService,
 ): McpServer {
   const server = new McpServer(
     { name: "sleeper-draft-assistant", version: "0.1.0" },
     {
       instructions:
-        "Call get_live_draft_context immediately before every Sleeper draft or player-availability recommendation, even if it was called earlier in the chat. In-season availability is based on fresh league rosters. Per-player waiver and lock status are unknown. Treat available-player ordering as Sleeper search metadata, not an expert ranking. This server is read-only and never makes draft selections.",
+        "Use list_leagues to discover league IDs, get_league_context for current selected lineups and weekly scores, get_league_rosters for full ownership, search_players for targeted player lookup across leagues, and get_league_activity for public transaction history. Refresh the relevant tools immediately before recommendations. Use get_live_draft_context for draft questions; its legacy lineup_slots describe potential roster coverage, not selected starters. Current rosters and historical weekly lineups are distinct. Unrostered does not guarantee add eligibility: waiver and lock status are unknown. Sleeper search_rank is discovery metadata, not an expert ranking. News, projections, private pending bids and documented elimination status are unavailable. All tools are read-only.",
     },
   );
 
@@ -132,12 +136,121 @@ export function createMcpServer(
     },
   );
 
+  if (leagueContext) registerLeagueTools(server, leagueContext, options);
+
   return server;
+}
+
+const idSchema = z.string().trim().min(1).max(64);
+const userSchema = idSchema.optional().describe("Sleeper username or user ID; defaults to SLEEPER_USER_ID when configured.");
+const weekSchema = z.number().int().min(1).max(22);
+const pageSchema = {
+  limit: z.number().int().min(1).max(100).default(50),
+  offset: z.number().int().min(0).max(100_000).default(0),
+};
+const readOnlyAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+} as const;
+const leagueOutputSchema = {
+  snapshot: z.object({
+    schema_version: z.string(),
+    refreshed_at: z.string(),
+    refresh_latency_ms: z.number(),
+    source: z.string(),
+    partial: z.boolean(),
+    issues: z.array(z.object({ source: z.string(), message: z.string() })),
+    sources: z.record(z.string(), z.unknown()),
+  }).passthrough(),
+};
+
+async function leagueResult(operation: () => Promise<Record<string, unknown>>) {
+  try {
+    const snapshot = await operation();
+    return {
+      structuredContent: { snapshot },
+      content: [{ type: "text" as const, text: "Use the structured Sleeper snapshot. Check partial, issues, sources and pagination before interpreting the results." }],
+    };
+  } catch (error) {
+    return {
+      isError: true,
+      content: [{ type: "text" as const, text: `Unable to refresh Sleeper data: ${error instanceof Error ? error.message : "Unknown Sleeper error"}` }],
+    };
+  }
+}
+
+function registerLeagueTools(server: McpServer, service: LeagueContextService, options: ServerOptions) {
+  server.registerTool("list_leagues", {
+    title: "List Sleeper leagues",
+    description: "Find a user's NFL leagues and IDs for a season, including scoring/settings and previous-season league links. If season is omitted, resolve it from live NFL state rather than the calendar year.",
+    inputSchema: { user: userSchema, season: z.string().regex(/^\d{4}$/).optional() },
+    outputSchema: leagueOutputSchema,
+    annotations: readOnlyAnnotations,
+  }, async ({ user, season }, extra) => leagueResult(async () => {
+    const resolvedUser = user ?? options.defaultUser;
+    if (!resolvedUser) throw new Error("Pass user or configure SLEEPER_USER_ID on the server.");
+    return service.listLeagues({ user: resolvedUser, season, signal: extra.signal });
+  }));
+
+  server.registerTool("get_league_context", {
+    title: "Get Sleeper league context",
+    description: "Refresh rules, current selected starter slots (including empty/repeated slots), bench/IR/taxi, raw budget fields, and league-wide weekly scores. Optional user selects a manager's roster. Requested-week lineups are separate from current rosters. Historical or non-regular seasons need an explicit week. Does not infer chopped elimination status.",
+    inputSchema: { league_id: idSchema, user: userSchema, week: weekSchema.optional() },
+    outputSchema: leagueOutputSchema,
+    annotations: readOnlyAnnotations,
+  }, async ({ league_id, user, week }, extra) => leagueResult(() => service.getLeagueContext({
+    leagueId: league_id, user: user ?? options.defaultUser, week, signal: extra.signal,
+  })));
+
+  server.registerTool("get_league_rosters", {
+    title: "Get all Sleeper league rosters",
+    description: "Refresh every team's full current player ownership, selected starters, bench/reserve/taxi and raw roster/budget settings. Includes co-owned and ownerless rosters. No eliminated-team inference or exact remaining-FAAB guarantee.",
+    inputSchema: { league_id: idSchema },
+    outputSchema: leagueOutputSchema,
+    annotations: readOnlyAnnotations,
+  }, async ({ league_id }, extra) => leagueResult(() => service.getLeagueRosters({ leagueId: league_id, signal: extra.signal })));
+
+  server.registerTool("search_players", {
+    title: "Search Sleeper players and ownership",
+    description: "Search the full daily-cached NFL catalog by name, position or explicit IDs, independent of draft candidate limits. Refresh ownership across up to 10 supplied leagues. available_only means known unrostered in ALL supplied leagues, never guaranteed add/waiver eligibility. Explicit IDs can return unknown catalog entries. Results are paginated; search_rank is not a recommendation.",
+    inputSchema: {
+      league_ids: z.array(idSchema).min(1).max(10).optional(),
+      query: z.string().trim().min(1).max(120).optional(),
+      positions: z.array(z.string().trim().min(1).max(20)).min(1).max(20).optional(),
+      player_ids: z.array(idSchema).min(1).max(100).optional(),
+      available_only: z.boolean().default(false),
+      ...pageSchema,
+    },
+    outputSchema: leagueOutputSchema,
+    annotations: readOnlyAnnotations,
+  }, async ({ league_ids, query, positions, player_ids, available_only, limit, offset }, extra) => leagueResult(() => service.searchPlayers({
+    leagueIds: league_ids, query, positions, playerIds: player_ids, availableOnly: available_only, limit, offset, signal: extra.signal,
+  })));
+
+  server.registerTool("get_league_activity", {
+    title: "Get Sleeper league activity",
+    description: "Read public weekly waiver, free-agent and trade transactions with adds/drops, exposed completed bids, traded picks and raw budget transfers. Filter by type, roster or player and paginate newest first. Defaults to current and previous regular-season weeks when the season matches this league; pass weeks for history. Failed weeks are flagged partial. No private pending bids, waiver-clearance inference or eliminated-team inference.",
+    inputSchema: {
+      league_id: idSchema,
+      weeks: z.array(weekSchema).min(1).max(22).optional(),
+      types: z.array(z.enum(["trade", "free_agent", "waiver"])).min(1).max(3).optional(),
+      roster_ids: z.array(z.number().int().positive()).min(1).max(100).optional(),
+      player_ids: z.array(idSchema).min(1).max(100).optional(),
+      ...pageSchema,
+    },
+    outputSchema: leagueOutputSchema,
+    annotations: readOnlyAnnotations,
+  }, async ({ league_id, weeks, types, roster_ids, player_ids, limit, offset }, extra) => leagueResult(() => service.getLeagueActivity({
+    leagueId: league_id, weeks, types, rosterIds: roster_ids, playerIds: player_ids, limit, offset, signal: extra.signal,
+  })));
 }
 
 export function createApp(
   draftContext: DraftContextService,
   options: ServerOptions = {},
+  leagueContext?: LeagueContextService,
 ): Express {
   const app = express();
   const allowedOrigins = new Set(options.allowedOrigins ?? []);
@@ -225,7 +338,7 @@ export function createApp(
   });
 
   app.post("/mcp", async (request, response) => {
-    const server = createMcpServer(draftContext, options);
+    const server = createMcpServer(draftContext, options, leagueContext);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
