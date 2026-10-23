@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Read-only Sleeper draft context over Streamable HTTP MCP",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.23.4"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
